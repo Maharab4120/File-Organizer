@@ -14,8 +14,8 @@ import java.util.Scanner;
 enum FileCategory {
     IMAGES("Images", new String[]{"jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "ico"}),
     PDFS("PDFs", new String[]{"pdf"}),
-    DOCUMENTS("Documents", new String[]{"doc", "docx", "txt", "rtf", "odt", "md"}),
-    VIDEOS("Videos", new String[]{"mp4", "avi", "mkv", "mov", "wmv", "flv", "webm"}),
+    DOCUMENTS("Documents", new String[]{"doc", "docx", "txt", "rtf", "odt", "md", "srt"}),
+    VIDEOS("Videos", new String[]{"mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "mpeg"}),
     MUSIC("Music", new String[]{"mp3", "wav", "flac", "aac", "ogg", "wma"}),
     ARCHIVES("Archives", new String[]{"zip", "rar", "7z", "tar", "gz", "bz2"}),
     EXECUTABLES("Executables", new String[]{"exe", "msi", "sh", "bat", "cmd", "jar"}),
@@ -171,10 +171,37 @@ public class Main {
         System.out.println("Java Desktop Application v1.0");
         System.out.println();
 
+        // Detect OS
+        String os = System.getProperty("os.name").toLowerCase();
+        System.out.println("Operating System: " + System.getProperty("os.name"));
+        System.out.println();
+
+        // Show path examples based on OS
+        if (os.contains("win")) {
+            System.out.println("📌 Windows path examples:");
+            System.out.println("   C:\\Users\\YourName\\Downloads");
+            System.out.println("   C:/Users/YourName/Downloads (also works)");
+        } else if (os.contains("mac")) {
+            System.out.println("📌 Mac path examples:");
+            System.out.println("   /Users/YourName/Downloads");
+        } else {
+            System.out.println("📌 Linux path examples:");
+            System.out.println("   /home/username/Downloads");
+        }
+        System.out.println();
+
         Scanner scanner = new Scanner(System.in);
 
         System.out.print("Enter folder path to organize: ");
         String folderPath = scanner.nextLine().trim();
+
+        // Remove quotes if user pasted with quotes
+        if (folderPath.startsWith("\"") && folderPath.endsWith("\"")) {
+            folderPath = folderPath.substring(1, folderPath.length() - 1);
+        }
+
+        // Normalize path: convert Windows backslashes to forward slashes
+        folderPath = folderPath.replace("\\", "/");
 
         // Validate input
         if (folderPath.isEmpty()) {
