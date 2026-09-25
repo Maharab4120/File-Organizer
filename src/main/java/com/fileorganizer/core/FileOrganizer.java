@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -14,6 +15,7 @@ public class FileOrganizer {
     private final List<File> filesToOrganize;
     private boolean dryRun;
     private ProgressListener progressListener;
+    private DatabaseManager database;
 
     public FileOrganizer(String sourcePath) {
         this.sourcePath = sourcePath;
@@ -21,49 +23,42 @@ public class FileOrganizer {
         this.dryRun = false;
     }
 
-    public void setDryRun(boolean dryRun) {
-        this.dryRun = dryRun;
-    }
-
-    public void setProgressListener(ProgressListener listener) {
-        this.progressListener = listener;
-    }
+    public void setDryRun(boolean dryRun) { this.dryRun = dryRun; }
+    public void setProgressListener(ProgressListener l) { this.progressListener = l; }
+    public void setDatabase(DatabaseManager db) { this.database = db; }
 
     private void notify(int current, int total, String message) {
-        if (progressListener != null) {
-            progressListener.update(current, total, message);
-        }
+        if (progressListener != null) progressListener.update(current, total, message);
     }
 
     public List<File> scanFolder() {
         filesToOrganize.clear();
         File folder = new File(sourcePath);
-
         if (!folder.exists() || !folder.isDirectory()) {
             System.err.println("Error: Path is not a valid directory!");
             return filesToOrganize;
         }
-
         File[] files = folder.listFiles();
         if (files == null) return filesToOrganize;
-
         for (File file : files) {
             if (file.isFile()) filesToOrganize.add(file);
         }
-
         System.out.println("Found " + filesToOrganize.size() + " files to organize");
         return filesToOrganize;
     }
 
-    public void organizeFiles() {
+    /** Returns the batch ID (for undo) or null if nothing was moved. */
+    public String organizeFiles() {
         if (filesToOrganize.isEmpty()) {
             System.out.println("No files to organize. Run scanFolder() first.");
-            return;
+            return null;
         }
 
         System.out.println(dryRun ? "DRY RUN - No files will be moved" : "Organizing files...");
         int total = filesToOrganize.size();
         int moved = 0, skipped = 0, errors = 0;
+
+        String batchId = (database != null && !dryRun) ? database.newBatchId() : null;
 
         for (int i = 0; i < total; i++) {
             File file = filesToOrganize.get(i);
@@ -73,7 +68,6 @@ public class FileOrganizer {
 
                 Path destFolder = Paths.get(sourcePath, category.getFolderName());
                 if (!dryRun) Files.createDirectories(destFolder);
-
                 Path destPath = destFolder.resolve(fileName);
 
                 if (!dryRun && Files.exists(destPath)) {
@@ -91,6 +85,17 @@ public class FileOrganizer {
                     System.out.println("Moved: " + fileName + " -> " + category.getFolderName());
                     notify(i + 1, total, "Moved: " + fileName);
                     moved++;
+
+                    if (database != null && batchId != null) {
+                        try {
+                            database.logMove(batchId,
+                                    file.getAbsolutePath(),
+                                    destPath.toAbsolutePath().toString(),
+                                    category.getFolderName());
+                        } catch (SQLException ex) {
+                            System.err.println("DB log failed: " + ex.getMessage());
+                        }
+                    }
                 }
             } catch (IOException e) {
                 System.err.println("Error moving file: " + file.getName() + " - " + e.getMessage());
@@ -99,8 +104,10 @@ public class FileOrganizer {
             }
         }
 
-        System.out.println("\nDone. Moved: " + moved + ", Skipped: " + skipped + ", Errors: " + errors);
+        System.out.println("\nDone. Moved: " + moved + ", Skipped: " + skipped
+                + ", Errors: " + errors);
         notify(total, total, "Done: " + moved + " moved, " + skipped + " skipped");
+        return batchId;
     }
 
     private String getFileExtension(String fileName) {
@@ -108,7 +115,5 @@ public class FileOrganizer {
         return (i == -1 || i == fileName.length() - 1) ? "" : fileName.substring(i + 1);
     }
 
-    public List<File> getFilesToOrganize() {
-        return filesToOrganize;
-    }
+    public List<File> getFilesToOrganize() { return filesToOrganize; }
 }

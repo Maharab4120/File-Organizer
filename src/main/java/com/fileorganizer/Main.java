@@ -1,5 +1,6 @@
 package com.fileorganizer;
 
+import com.fileorganizer.core.DatabaseManager;
 import com.fileorganizer.core.FileCategory;
 import com.fileorganizer.core.FileOrganizer;
 import javafx.application.Application;
@@ -17,18 +18,37 @@ import javafx.stage.DirectoryChooser;
 import javafx.stage.Stage;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.sql.SQLException;
 import java.util.List;
 
 public class Main extends Application {
 
     private FileOrganizer organizer;
+    private DatabaseManager database;
     private final ObservableList<File> fileRows = FXCollections.observableArrayList();
     private Label folderLabel;
     private Label statusLabel;
     private Button chooseFolderBtn;
     private Button previewBtn;
     private Button organizeBtn;
+    private Button undoBtn;
     private ProgressBar progressBar;
+
+    @Override
+    public void init() {
+        try {
+            database = new DatabaseManager();
+            System.out.println("DB: " + database.getDbPath());
+        } catch (SQLException e) {
+            System.err.println("DB init failed: " + e.getMessage());
+            database = null;
+        }
+    }
 
     @Override
     public void start(Stage stage) {
@@ -64,30 +84,31 @@ public class Main extends Application {
         // --- Bottom bar ---
         previewBtn = new Button("🔍 Preview");
         organizeBtn = new Button("✅ Organize");
+        undoBtn = new Button("↩️ Undo Last");
         progressBar = new ProgressBar(0);
-        progressBar.setPrefWidth(220);
+        progressBar.setPrefWidth(200);
         statusLabel = new Label("Ready");
 
         previewBtn.setDisable(true);
         organizeBtn.setDisable(true);
+        undoBtn.setDisable(database == null);
 
-        HBox bottomBar = new HBox(10, previewBtn, organizeBtn, progressBar, statusLabel);
+        HBox bottomBar = new HBox(10, previewBtn, organizeBtn, undoBtn, progressBar, statusLabel);
         bottomBar.setPadding(new Insets(10));
         bottomBar.setAlignment(Pos.CENTER_LEFT);
 
-        // --- Layout ---
         BorderPane root = new BorderPane();
         root.setTop(topBar);
         root.setCenter(table);
         root.setBottom(bottomBar);
 
-        // --- Actions ---
         chooseFolderBtn.setOnAction(e -> chooseFolder(stage));
         previewBtn.setOnAction(e -> doPreview());
         organizeBtn.setOnAction(e -> doOrganize());
+        undoBtn.setOnAction(e -> doUndo());
 
         stage.setTitle("CloudSort");
-        stage.setScene(new Scene(root, 900, 560));
+        stage.setScene(new Scene(root, 980, 560));
         stage.show();
     }
 
@@ -99,6 +120,7 @@ public class Main extends Application {
 
         folderLabel.setText(chosen.getAbsolutePath());
         organizer = new FileOrganizer(chosen.getAbsolutePath());
+        organizer.setDatabase(database);
         fileRows.clear();
         progressBar.setProgress(0);
         statusLabel.setText("Folder selected. Click Preview to scan.");
@@ -139,7 +161,7 @@ public class Main extends Application {
             progressBar.progressProperty().unbind();
             statusLabel.textProperty().unbind();
             progressBar.setProgress(1.0);
-            statusLabel.setText("Done.");
+            statusLabel.setText("Done. You can Undo Last if needed.");
             fileRows.clear();
             organizeBtn.setDisable(true);
             setBusy(false);
@@ -157,10 +179,42 @@ public class Main extends Application {
         t.start();
     }
 
+    private void doUndo() {
+        if (database == null) return;
+        try {
+            List<DatabaseManager.MoveRecord> records = database.getLastBatch();
+            if (records.isEmpty()) {
+                statusLabel.setText("Nothing to undo.");
+                return;
+            }
+
+            int restored = 0, failed = 0;
+            for (DatabaseManager.MoveRecord r : records) {
+                Path from = Paths.get(r.destPath());
+                Path to   = Paths.get(r.sourcePath());
+                try {
+                    if (!Files.exists(from)) { failed++; continue; }
+                    Files.createDirectories(to.getParent());
+                    Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
+                    restored++;
+                } catch (IOException ex) {
+                    System.err.println("Undo failed for " + from + ": " + ex.getMessage());
+                    failed++;
+                }
+            }
+
+            database.markUndone(records);
+            statusLabel.setText("Undo: " + restored + " restored, " + failed + " failed.");
+        } catch (SQLException ex) {
+            statusLabel.setText("Undo error: " + ex.getMessage());
+        }
+    }
+
     private void setBusy(boolean busy) {
         chooseFolderBtn.setDisable(busy);
         previewBtn.setDisable(busy);
         organizeBtn.setDisable(busy);
+        undoBtn.setDisable(busy || database == null);
     }
 
     private String extractExt(String name) {
@@ -173,6 +227,11 @@ public class Main extends Application {
         if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
         if (bytes < 1024L * 1024 * 1024) return String.format("%.1f MB", bytes / (1024.0 * 1024));
         return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+    }
+
+    @Override
+    public void stop() throws Exception {
+        if (database != null) database.close();
     }
 
     public static void main(String[] args) {
