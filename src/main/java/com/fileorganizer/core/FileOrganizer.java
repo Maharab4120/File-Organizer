@@ -1,5 +1,7 @@
 package com.fileorganizer.core;
 
+import com.fileorganizer.util.FileHasher;
+
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -8,22 +10,30 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class FileOrganizer {
+    private static final String DUPLICATES_FOLDER = "Duplicates";
+
     private final String sourcePath;
     private final List<File> filesToOrganize;
+    private RuleEngine rules;
     private boolean dryRun;
+    private boolean detectDuplicates;
     private ProgressListener progressListener;
     private DatabaseManager database;
 
-    public FileOrganizer(String sourcePath) {
+    public FileOrganizer(String sourcePath, RuleEngine rules) {
         this.sourcePath = sourcePath;
+        this.rules = rules;
         this.filesToOrganize = new ArrayList<>();
-        this.dryRun = false;
     }
 
-    public void setDryRun(boolean dryRun) { this.dryRun = dryRun; }
+    public void setRules(RuleEngine rules) { this.rules = rules; }
+    public void setDryRun(boolean v) { this.dryRun = v; }
+    public void setDetectDuplicates(boolean v) { this.detectDuplicates = v; }
     public void setProgressListener(ProgressListener l) { this.progressListener = l; }
     public void setDatabase(DatabaseManager db) { this.database = db; }
 
@@ -40,33 +50,45 @@ public class FileOrganizer {
         }
         File[] files = folder.listFiles();
         if (files == null) return filesToOrganize;
-        for (File file : files) {
-            if (file.isFile()) filesToOrganize.add(file);
-        }
+        for (File f : files) if (f.isFile()) filesToOrganize.add(f);
         System.out.println("Found " + filesToOrganize.size() + " files to organize");
         return filesToOrganize;
     }
 
-    /** Returns the batch ID (for undo) or null if nothing was moved. */
     public String organizeFiles() {
-        if (filesToOrganize.isEmpty()) {
-            System.out.println("No files to organize. Run scanFolder() first.");
-            return null;
-        }
+        if (filesToOrganize.isEmpty()) return null;
 
-        System.out.println(dryRun ? "DRY RUN - No files will be moved" : "Organizing files...");
+        System.out.println(dryRun ? "DRY RUN" : "Organizing files...");
         int total = filesToOrganize.size();
-        int moved = 0, skipped = 0, errors = 0;
+        int moved = 0, skipped = 0, errors = 0, duplicates = 0;
+        long duplicateBytes = 0;
 
         String batchId = (database != null && !dryRun) ? database.newBatchId() : null;
+        Map<String, File> hashToFirst = detectDuplicates ? new HashMap<>() : null;
 
         for (int i = 0; i < total; i++) {
             File file = filesToOrganize.get(i);
             try {
                 String fileName = file.getName();
-                FileCategory category = FileCategory.fromExtension(getFileExtension(fileName));
+                String category = rules.findCategory(fileName);
+                boolean isDuplicate = false;
 
-                Path destFolder = Paths.get(sourcePath, category.getFolderName());
+                if (detectDuplicates) {
+                    notify(i + 1, total, "Hashing: " + fileName);
+                    String hash = FileHasher.sha256(file);
+                    if (hashToFirst.containsKey(hash)) {
+                        isDuplicate = true;
+                        category = DUPLICATES_FOLDER;
+                        duplicates++;
+                        duplicateBytes += file.length();
+                        System.out.println("Duplicate: " + fileName
+                                + " (matches " + hashToFirst.get(hash).getName() + ")");
+                    } else {
+                        hashToFirst.put(hash, file);
+                    }
+                }
+
+                Path destFolder = Paths.get(sourcePath, category);
                 if (!dryRun) Files.createDirectories(destFolder);
                 Path destPath = destFolder.resolve(fileName);
 
@@ -78,41 +100,45 @@ public class FileOrganizer {
                 }
 
                 if (dryRun) {
-                    System.out.println("Would move: " + fileName + " -> " + category.getFolderName());
-                    notify(i + 1, total, "Would move: " + fileName);
+                    String tag = isDuplicate ? "[DUP] " : "";
+                    System.out.println("Would move: " + tag + fileName + " -> " + category);
+                    notify(i + 1, total, "Would move: " + tag + fileName);
                 } else {
                     Files.move(file.toPath(), destPath, StandardCopyOption.REPLACE_EXISTING);
-                    System.out.println("Moved: " + fileName + " -> " + category.getFolderName());
+                    System.out.println("Moved: " + fileName + " -> " + category);
                     notify(i + 1, total, "Moved: " + fileName);
                     moved++;
 
                     if (database != null && batchId != null) {
                         try {
-                            database.logMove(batchId,
-                                    file.getAbsolutePath(),
-                                    destPath.toAbsolutePath().toString(),
-                                    category.getFolderName());
+                            database.logMove(batchId, file.getAbsolutePath(),
+                                    destPath.toAbsolutePath().toString(), category);
                         } catch (SQLException ex) {
                             System.err.println("DB log failed: " + ex.getMessage());
                         }
                     }
                 }
             } catch (IOException e) {
-                System.err.println("Error moving file: " + file.getName() + " - " + e.getMessage());
+                System.err.println("Error: " + file.getName() + " - " + e.getMessage());
                 notify(i + 1, total, "Error: " + file.getName());
                 errors++;
             }
         }
 
-        System.out.println("\nDone. Moved: " + moved + ", Skipped: " + skipped
-                + ", Errors: " + errors);
-        notify(total, total, "Done: " + moved + " moved, " + skipped + " skipped");
+        String dupSummary = duplicates > 0
+                ? " • " + duplicates + " duplicates (" + formatSize(duplicateBytes) + ")"
+                : "";
+        String summary = "Done: " + moved + " moved, " + skipped + " skipped" + dupSummary;
+        System.out.println("\n" + summary);
+        notify(total, total, summary);
         return batchId;
     }
 
-    private String getFileExtension(String fileName) {
-        int i = fileName.lastIndexOf('.');
-        return (i == -1 || i == fileName.length() - 1) ? "" : fileName.substring(i + 1);
+    private static String formatSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
+        if (bytes < 1024L * 1024 * 1024) return String.format("%.1f MB", bytes / (1024.0 * 1024));
+        return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
     }
 
     public List<File> getFilesToOrganize() { return filesToOrganize; }
