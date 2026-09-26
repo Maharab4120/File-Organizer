@@ -50,7 +50,14 @@ public class FileOrganizer {
         }
         File[] files = folder.listFiles();
         if (files == null) return filesToOrganize;
-        for (File f : files) if (f.isFile()) filesToOrganize.add(f);
+
+        for (File f : files) {
+            if (Thread.currentThread().isInterrupted()) {
+                System.out.println("Scan interrupted.");
+                break;
+            }
+            if (f.isFile()) filesToOrganize.add(f);
+        }
         System.out.println("Found " + filesToOrganize.size() + " files to organize");
         return filesToOrganize;
     }
@@ -63,17 +70,32 @@ public class FileOrganizer {
         int moved = 0, skipped = 0, errors = 0, duplicates = 0;
         long duplicateBytes = 0;
 
-        String batchId = (database != null && !dryRun) ? database.newBatchId() : null;
+        String batchId = null;
+        if (database != null && !dryRun) {
+            batchId = database.newBatchId();
+            try {
+                database.createBatch(batchId, sourcePath, rules != null ? rules.getName() : "Default");
+            } catch (SQLException ex) {
+                System.err.println("Failed to create batch record: " + ex.getMessage());
+            }
+        }
+
         Map<String, File> hashToFirst = detectDuplicates ? new HashMap<>() : null;
 
         for (int i = 0; i < total; i++) {
+            if (Thread.currentThread().isInterrupted()) {
+                System.out.println("Organization cancelled by user.");
+                notify(i, total, "Task cancelled.");
+                break;
+            }
+
             File file = filesToOrganize.get(i);
             try {
                 String fileName = file.getName();
-                String category = rules.findCategory(fileName);
+                String category = rules != null ? rules.findCategory(fileName) : "Other";
                 boolean isDuplicate = false;
 
-                if (detectDuplicates) {
+                if (detectDuplicates && hashToFirst != null) {
                     notify(i + 1, total, "Hashing: " + fileName);
                     String hash = FileHasher.sha256(file);
                     if (hashToFirst.containsKey(hash)) {

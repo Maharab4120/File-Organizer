@@ -24,6 +24,8 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.sql.SQLException;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.prefs.Preferences;
 
 public class Main extends Application {
@@ -36,6 +38,12 @@ public class Main extends Application {
     private RuleEngine rules = RuleEngine.builtInDefaults();
     private Scene scene;
 
+    private final ExecutorService executor = Executors.newFixedThreadPool(2, r -> {
+        Thread t = new Thread(r);
+        t.setDaemon(true);
+        return t;
+    });
+
     private final ObservableList<File> fileRows = FXCollections.observableArrayList();
     private Label folderLabel;
     private Label statusLabel;
@@ -45,6 +53,7 @@ public class Main extends Application {
     private Button previewBtn;
     private Button organizeBtn;
     private Button undoBtn;
+    private Button clearHistoryBtn;
     private Button fetchRulesBtn;
     private ToggleButton darkToggle;
     private CheckBox dupCheck;
@@ -72,7 +81,8 @@ public class Main extends Application {
     public void start(Stage stage) {
         // --- Rules bar ---
         rulesUrlField = new TextField(DEFAULT_RULES_URL);
-        rulesUrlField.setPrefWidth(500);
+        HBox.setHgrow(rulesUrlField, Priority.ALWAYS);
+
         fetchRulesBtn = new Button("🔄 Fetch Rules");
         rulesLabel = new Label("Rules: " + rules.getName());
         darkToggle = new ToggleButton("🌙 Dark");
@@ -96,23 +106,24 @@ public class Main extends Application {
 
         // --- Table ---
         TableView<File> table = new TableView<>(fileRows);
+        table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
 
         TableColumn<File, String> nameCol = new TableColumn<>("Name");
         nameCol.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().getName()));
-        nameCol.setPrefWidth(320);
+        nameCol.prefWidthProperty().bind(table.widthProperty().multiply(0.40));
 
         TableColumn<File, String> extCol = new TableColumn<>("Extension");
         extCol.setCellValueFactory(d -> new SimpleStringProperty(extractExt(d.getValue().getName())));
-        extCol.setPrefWidth(90);
+        extCol.prefWidthProperty().bind(table.widthProperty().multiply(0.15));
 
         TableColumn<File, String> catCol = new TableColumn<>("Category");
         catCol.setCellValueFactory(d -> new SimpleStringProperty(
                 rules.findCategory(d.getValue().getName())));
-        catCol.setPrefWidth(120);
+        catCol.prefWidthProperty().bind(table.widthProperty().multiply(0.25));
 
         TableColumn<File, String> sizeCol = new TableColumn<>("Size");
         sizeCol.setCellValueFactory(d -> new SimpleStringProperty(formatSize(d.getValue().length())));
-        sizeCol.setPrefWidth(90);
+        sizeCol.prefWidthProperty().bind(table.widthProperty().multiply(0.20));
 
         table.getColumns().addAll(nameCol, extCol, catCol, sizeCol);
 
@@ -120,6 +131,7 @@ public class Main extends Application {
         previewBtn = new Button("🔍 Preview");
         organizeBtn = new Button("✅ Organize");
         undoBtn = new Button("↩️ Undo Last");
+        clearHistoryBtn = new Button("🗑️ Clear History");
         dupCheck = new CheckBox("Detect duplicates");
         progressBar = new ProgressBar(0);
         progressBar.setPrefWidth(180);
@@ -128,9 +140,10 @@ public class Main extends Application {
         previewBtn.setDisable(true);
         organizeBtn.setDisable(true);
         undoBtn.setDisable(database == null);
+        clearHistoryBtn.setDisable(database == null);
 
         HBox bottomBar = new HBox(10,
-                previewBtn, organizeBtn, undoBtn, dupCheck, progressBar, statusLabel);
+                previewBtn, organizeBtn, undoBtn, clearHistoryBtn, dupCheck, progressBar, statusLabel);
         bottomBar.setPadding(new Insets(10));
         bottomBar.setAlignment(Pos.CENTER_LEFT);
 
@@ -146,6 +159,7 @@ public class Main extends Application {
         previewBtn.setOnAction(e -> doPreview());
         organizeBtn.setOnAction(e -> doOrganize());
         undoBtn.setOnAction(e -> doUndo());
+        clearHistoryBtn.setOnAction(e -> doClearHistory());
         fetchRulesBtn.setOnAction(e -> doFetchRules());
         darkToggle.setOnAction(e -> applyDarkMode(darkToggle.isSelected()));
 
@@ -155,6 +169,8 @@ public class Main extends Application {
         applyDarkMode(dark);
 
         stage.setTitle("CloudSort");
+        stage.setMinWidth(700);
+        stage.setMinHeight(400);
         stage.setScene(scene);
         stage.show();
     }
@@ -166,14 +182,14 @@ public class Main extends Application {
             if (css != null) scene.getStylesheets().add(css.toExternalForm());
         }
         Preferences.userNodeForPackage(Main.class).putBoolean("darkMode", dark);
-        darkToggle.setText(dark ? "☀ Light" : "🌙 Dark");
+        darkToggle.setText(dark ? "Light Mode" : "Dark Mode");
     }
 
     private void doFetchRules() {
         String url = rulesUrlField.getText().trim();
         if (url.isEmpty()) { statusLabel.setText("Enter a rules URL"); return; }
 
-        fetchRulesBtn.setDisable(true);
+        setBusy(true);
         statusLabel.setText("Fetching rules…");
 
         Task<RuleEngine> task = new Task<>() {
@@ -190,23 +206,20 @@ public class Main extends Application {
             rulesLabel.setText("Rules: " + rules.getName()
                     + " (" + rules.getCategories().size() + " categories)");
             statusLabel.setText("Rules updated");
-            fetchRulesBtn.setDisable(false);
+            setBusy(false);
             if (organizer != null) organizer.setRules(rules);
             if (!fileRows.isEmpty()) {
-                FileOrganizer tmp = new FileOrganizer(fileRows.get(0).getParent(), rules);
-                fileRows.setAll(tmp.scanFolder());
+                doPreview();
             }
         });
 
         task.setOnFailed(e -> {
             statusLabel.setText("Fetch failed: "
                     + (task.getException() != null ? task.getException().getMessage() : "?"));
-            fetchRulesBtn.setDisable(false);
+            setBusy(false);
         });
 
-        Thread t = new Thread(task, "rules-fetcher");
-        t.setDaemon(true);
-        t.start();
+        executor.submit(task);
     }
 
     private void chooseFolder(Stage stage) {
@@ -228,11 +241,31 @@ public class Main extends Application {
 
     private void doPreview() {
         if (organizer == null) return;
-        organizer.setDetectDuplicates(dupCheck.isSelected());
-        List<File> files = organizer.scanFolder();
-        fileRows.setAll(files);
-        statusLabel.setText("Preview: " + files.size() + " files ready to organize");
-        organizeBtn.setDisable(files.isEmpty());
+        setBusy(true);
+        statusLabel.setText("Scanning folder...");
+
+        Task<List<File>> task = new Task<>() {
+            @Override
+            protected List<File> call() {
+                organizer.setDetectDuplicates(dupCheck.isSelected());
+                return organizer.scanFolder();
+            }
+        };
+
+        task.setOnSucceeded(e -> {
+            List<File> files = task.getValue();
+            fileRows.setAll(files);
+            statusLabel.setText("Preview: " + files.size() + " files ready to organize");
+            setBusy(false);
+            organizeBtn.setDisable(files.isEmpty());
+        });
+
+        task.setOnFailed(e -> {
+            statusLabel.setText("Scan failed: " + task.getException().getMessage());
+            setBusy(false);
+        });
+
+        executor.submit(task);
     }
 
     private void doOrganize() {
@@ -261,8 +294,8 @@ public class Main extends Application {
             statusLabel.textProperty().unbind();
             progressBar.setProgress(1.0);
             fileRows.clear();
-            organizeBtn.setDisable(true);
             setBusy(false);
+            organizeBtn.setDisable(true);
         });
 
         task.setOnFailed(e -> {
@@ -272,36 +305,77 @@ public class Main extends Application {
             setBusy(false);
         });
 
-        Thread t = new Thread(task, "organizer-worker");
-        t.setDaemon(true);
-        t.start();
+        executor.submit(task);
     }
 
     private void doUndo() {
         if (database == null) return;
-        try {
-            List<DatabaseManager.MoveRecord> records = database.getLastBatch();
-            if (records.isEmpty()) { statusLabel.setText("Nothing to undo."); return; }
+        setBusy(true);
+        statusLabel.setText("Undoing last batch...");
 
-            int restored = 0, failed = 0;
-            for (DatabaseManager.MoveRecord r : records) {
-                Path from = Paths.get(r.destPath());
-                Path to   = Paths.get(r.sourcePath());
-                try {
-                    if (!Files.exists(from)) { failed++; continue; }
-                    Files.createDirectories(to.getParent());
-                    Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
-                    restored++;
-                } catch (IOException ex) {
-                    System.err.println("Undo failed: " + from + " - " + ex.getMessage());
-                    failed++;
+        Task<String> task = new Task<>() {
+            @Override
+            protected String call() throws Exception {
+                List<DatabaseManager.MoveRecord> records = database.getLastBatch();
+                if (records.isEmpty()) {
+                    return "Nothing to undo.";
                 }
+
+                int restored = 0, failed = 0;
+                for (DatabaseManager.MoveRecord r : records) {
+                    Path from = Paths.get(r.destPath());
+                    Path to   = Paths.get(r.sourcePath());
+                    try {
+                        if (!Files.exists(from)) { failed++; continue; }
+                        Files.createDirectories(to.getParent());
+                        Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
+                        restored++;
+                    } catch (IOException ex) {
+                        System.err.println("Undo failed: " + from + " - " + ex.getMessage());
+                        failed++;
+                    }
+                }
+                database.markUndone(records);
+                return "Undo complete: " + restored + " restored, " + failed + " failed.";
             }
-            database.markUndone(records);
-            statusLabel.setText("Undo: " + restored + " restored, " + failed + " failed.");
-        } catch (SQLException ex) {
-            statusLabel.setText("Undo error: " + ex.getMessage());
-        }
+        };
+
+        task.setOnSucceeded(e -> {
+            statusLabel.setText(task.getValue());
+            setBusy(false);
+        });
+
+        task.setOnFailed(e -> {
+            statusLabel.setText("Undo error: " + task.getException().getMessage());
+            setBusy(false);
+        });
+
+        executor.submit(task);
+    }
+
+    private void doClearHistory() {
+        if (database == null) return;
+        setBusy(true);
+
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() throws Exception {
+                database.clearAllHistory();
+                return null;
+            }
+        };
+
+        task.setOnSucceeded(e -> {
+            statusLabel.setText("History cleared successfully.");
+            setBusy(false);
+        });
+
+        task.setOnFailed(e -> {
+            statusLabel.setText("Clear history error: " + task.getException().getMessage());
+            setBusy(false);
+        });
+
+        executor.submit(task);
     }
 
     private void setBusy(boolean busy) {
@@ -309,6 +383,7 @@ public class Main extends Application {
         previewBtn.setDisable(busy);
         organizeBtn.setDisable(busy);
         undoBtn.setDisable(busy || database == null);
+        clearHistoryBtn.setDisable(busy || database == null);
         fetchRulesBtn.setDisable(busy);
         dupCheck.setDisable(busy);
     }
@@ -326,6 +401,7 @@ public class Main extends Application {
     }
 
     @Override public void stop() throws Exception {
+        executor.shutdown();
         if (database != null) database.close();
     }
 

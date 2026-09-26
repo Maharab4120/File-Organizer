@@ -25,11 +25,28 @@ public class DatabaseManager implements AutoCloseable {
         }
         this.dbPath = dir.resolve("history.db");
         this.conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
+
+        // Enforce foreign key constraints in SQLite
+        try (Statement st = conn.createStatement()) {
+            st.execute("PRAGMA foreign_keys = ON;");
+        }
+
         initSchema();
     }
 
     private void initSchema() throws SQLException {
         try (Statement st = conn.createStatement()) {
+            // Table 1: batches (Parent table)
+            st.execute("""
+                CREATE TABLE IF NOT EXISTS batches (
+                    batch_id      TEXT PRIMARY KEY,
+                    source_folder TEXT NOT NULL,
+                    started_at    INTEGER NOT NULL,
+                    rule_pack     TEXT
+                )
+                """);
+
+            // Table 2: moves (Child table with Foreign Key)
             st.execute("""
                 CREATE TABLE IF NOT EXISTS moves (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,15 +55,28 @@ public class DatabaseManager implements AutoCloseable {
                     dest_path   TEXT    NOT NULL,
                     category    TEXT    NOT NULL,
                     moved_at    INTEGER NOT NULL,
-                    undone      INTEGER NOT NULL DEFAULT 0
+                    undone      INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (batch_id) REFERENCES batches(batch_id) ON DELETE CASCADE
                 )
                 """);
+
             st.execute("CREATE INDEX IF NOT EXISTS idx_batch ON moves(batch_id)");
         }
     }
 
     public String newBatchId() {
         return UUID.randomUUID().toString();
+    }
+
+    public void createBatch(String batchId, String sourceFolder, String rulePack) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO batches (batch_id, source_folder, started_at, rule_pack) VALUES (?, ?, ?, ?)")) {
+            ps.setString(1, batchId);
+            ps.setString(2, sourceFolder);
+            ps.setLong(3, System.currentTimeMillis());
+            ps.setString(4, rulePack);
+            ps.executeUpdate();
+        }
     }
 
     public void logMove(String batchId, String source, String dest, String category)
@@ -96,6 +126,13 @@ public class DatabaseManager implements AutoCloseable {
                 ps.addBatch();
             }
             ps.executeBatch();
+        }
+    }
+
+    public void clearAllHistory() throws SQLException {
+        try (Statement st = conn.createStatement()) {
+            st.execute("DELETE FROM moves");
+            st.execute("DELETE FROM batches");
         }
     }
 
